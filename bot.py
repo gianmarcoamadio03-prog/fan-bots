@@ -1,8 +1,8 @@
 import os
+import re
 import sqlite3
-import hashlib
-from contextlib import closing
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -25,288 +25,356 @@ from telegram.ext import (
 # =========================
 # CONFIG
 # =========================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID")  # gruppo staff dove arrivano le richieste
-DB_PATH = os.getenv("DB_PATH", "requests.db")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID", "").strip()  # staff group/supergroup id (es. -100...)
+DB_PATH = os.getenv("DB_PATH", "message_links.db").strip()  # su Railway puoi lasciarlo così
 
 if not BOT_TOKEN or not TARGET_CHAT_ID:
-    raise RuntimeError("Mancano BOT_TOKEN o TARGET_CHAT_ID nelle variabili d'ambiente")
+    raise RuntimeError("Imposta le variabili d'ambiente BOT_TOKEN e TARGET_CHAT_ID")
 
 SITE_URL = "https://cravattacinese.com"
 
-START_PROMPT = (
-    f"🔥 <b>DIMMI COSA CERCHI!</b>\n"
-    f"Inviami <b>foto</b>, <b>descrizione</b> e <b>budget</b> dell’articolo.\n"
-    f"Noi lo caricheremo su <b>CravattaCinese</b>: {SITE_URL}\n\n"
-    f"✅ Puoi fare richieste quante volte vuoi."
+WELCOME_TEXT = (
+    "🧵 *DIMMI COSA CERCHI!*\n\n"
+    "Inviami:\n"
+    "📸 una foto (se ce l’hai)\n"
+    "📝 descrizione\n"
+    "💰 budget\n\n"
+    "Noi lo caricheremo su *CravattaCinese*.\n"
+    f"🌐 {SITE_URL}"
 )
 
-AFTER_REQUEST_PROMPT = (
-    f"✅ <b>Richiesta inviata!</b>\n"
-    f"Se vuoi, puoi già farne un’altra.\n\n"
-    f"{START_PROMPT}"
+CONFIRM_TEXT = (
+    "✅ *Richiesta ricevuta!*\n"
+    "Ti aggiorniamo qui appena troviamo il prodotto.\n\n"
+    f"🌐 {SITE_URL}"
 )
 
-USER_ADDED_MSG = (
-    f"✅ <b>AGGIORNAMENTO:</b> il prodotto che hai richiesto è stato "
-    f"<b>trovato ed inserito</b> su CravattaCinese: {SITE_URL}\n"
+FOUND_TEXT = (
+    "✅ *Aggiornamento:* il prodotto è stato trovato e inserito su CravattaCinese!\n"
+    f"🌐 {SITE_URL}"
 )
 
-USER_NOT_FOUND_MSG = (
-    f"❌ <b>AGGIORNAMENTO:</b> per ora <b>non siamo riusciti a trovarlo</b>.\n"
-    f"Se vuoi, manda una nuova foto/descrizione/budget per riprovare: {SITE_URL}\n"
+NOT_FOUND_TEXT = (
+    "❌ *Aggiornamento:* non siamo riusciti a trovare il prodotto.\n"
+    "Se vuoi, manda più dettagli o un’altra foto."
 )
 
 # =========================
 # DB
 # =========================
+def db_conn():
+    return sqlite3.connect(DB_PATH)
+
 def init_db():
-    with closing(sqlite3.connect(DB_PATH)) as conn, closing(conn.cursor()) as cur:
-        cur.execute(
+    with db_conn() as con:
+        con.execute(
             """
             CREATE TABLE IF NOT EXISTS requests (
-                req_id TEXT PRIMARY KEY,
-                user_chat_id TEXT NOT NULL,
-                user_id TEXT,
-                username TEXT,
-                original_text TEXT,
-                created_at TEXT NOT NULL,
-                status TEXT DEFAULT 'pending'
+              request_id TEXT PRIMARY KEY,
+              user_id INTEGER NOT NULL,
+              user_chat_id INTEGER NOT NULL,
+              username TEXT,
+              created_at TEXT NOT NULL,
+              description TEXT,
+              budget TEXT,
+              photo_file_id TEXT,
+              staff_chat_id TEXT NOT NULL,
+              staff_message_id INTEGER,
+              status TEXT DEFAULT 'pending'
             )
             """
         )
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS admin_messages (
-                admin_message_id INTEGER PRIMARY KEY,
-                admin_chat_id TEXT NOT NULL,
-                req_id TEXT NOT NULL
-            )
-            """
-        )
-        conn.commit()
-
-
-def make_req_id(user_chat_id: int, content: str) -> str:
-    base = f"{user_chat_id}|{datetime.utcnow().isoformat()}|{content}".encode("utf-8", "ignore")
-    return hashlib.sha256(base).hexdigest()[:16]
-
-
-def save_request(req_id: str, user_chat_id: int, user_id: int | None, username: str | None, original_text: str):
-    with closing(sqlite3.connect(DB_PATH)) as conn, closing(conn.cursor()) as cur:
-        cur.execute(
-            """
-            INSERT OR REPLACE INTO requests (req_id, user_chat_id, user_id, username, original_text, created_at, status)
-            VALUES (?, ?, ?, ?, ?, ?, 'pending')
-            """,
-            (req_id, str(user_chat_id), str(user_id) if user_id else None, username, original_text, datetime.utcnow().isoformat()),
-        )
-        conn.commit()
-
-
-def link_admin_message(admin_chat_id: int, admin_message_id: int, req_id: str):
-    with closing(sqlite3.connect(DB_PATH)) as conn, closing(conn.cursor()) as cur:
-        cur.execute(
-            """
-            INSERT OR REPLACE INTO admin_messages (admin_message_id, admin_chat_id, req_id)
-            VALUES (?, ?, ?)
-            """,
-            (admin_message_id, str(admin_chat_id), req_id),
-        )
-        conn.commit()
-
-
-def get_req_by_admin_message(admin_chat_id: int, admin_message_id: int):
-    with closing(sqlite3.connect(DB_PATH)) as conn, closing(conn.cursor()) as cur:
-        cur.execute(
-            """
-            SELECT r.req_id, r.user_chat_id, r.status
-            FROM admin_messages a
-            JOIN requests r ON r.req_id = a.req_id
-            WHERE a.admin_chat_id = ? AND a.admin_message_id = ?
-            """,
-            (str(admin_chat_id), admin_message_id),
-        )
-        return cur.fetchone()
-
-
-def set_status(req_id: str, status: str):
-    with closing(sqlite3.connect(DB_PATH)) as conn, closing(conn.cursor()) as cur:
-        cur.execute("UPDATE requests SET status = ? WHERE req_id = ?", (status, req_id))
-        conn.commit()
-
+        con.commit()
 
 # =========================
-# BOT LOGIC
+# HELPERS
 # =========================
-def admin_keyboard(req_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
+BUDGET_RE = re.compile(r"(€\s*\d+[\d.,]*|\d+[\d.,]*\s*€|\b\d{1,6}[\d.,]*\b)", re.IGNORECASE)
+
+def extract_budget(text: str) -> str | None:
+    if not text:
+        return None
+    m = BUDGET_RE.search(text)
+    if not m:
+        return None
+    return m.group(0).strip()
+
+def clean_text(text: str) -> str:
+    if not text:
+        return ""
+    return text.strip()
+
+def keyboard_welcome():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🌐 Apri CravattaCinese", url=SITE_URL)],
+    ])
+
+def keyboard_after_request():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🌐 Apri CravattaCinese", url=SITE_URL)],
+        [InlineKeyboardButton("➕ Fai un'altra richiesta", callback_data="new_request")],
+    ])
+
+def keyboard_staff(request_id: str):
+    return InlineKeyboardMarkup([
         [
-            [
-                InlineKeyboardButton("✅ Aggiunto", callback_data=f"ok:{req_id}"),
-                InlineKeyboardButton("❌ Non trovato", callback_data=f"no:{req_id}"),
-            ]
-        ]
+            InlineKeyboardButton("✅ Trovato", callback_data=f"found:{request_id}"),
+            InlineKeyboardButton("❌ Non trovato", callback_data=f"notfound:{request_id}"),
+        ],
+    ])
+
+def staff_message_text(request_id: str, user_id: int, username: str | None, description: str, budget: str):
+    u = f"@{username}" if username else "(senza username)"
+    return (
+        "📩 *NUOVA RICHIESTA*\n"
+        f"🆔 Request ID: `{request_id}`\n"
+        f"👤 Utente: `{user_id}` {u}\n"
+        f"🕒 Ora: `{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}`\n\n"
+        f"📝 *Descrizione:*\n{description or '_(manca descrizione)_'}\n\n"
+        f"💰 *Budget:* {budget or '_(manca budget)_'}\n"
     )
 
-
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_chat.send_message(
-        START_PROMPT,
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
-    )
-
-
-def format_user_header(update: Update) -> str:
-    u = update.effective_user
-    name = (u.full_name or "").strip()
-    username = f"@{u.username}" if u.username else "—"
-    return f"<b>Richiedente:</b> {name}\n<b>Username:</b> {username}\n<b>User ID:</b> <code>{u.id}</code>"
-
-
-async def handle_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Accettiamo: testo, foto, caption
-    chat = update.effective_chat
-    user = update.effective_user
-
-    text = ""
-    has_photo = False
-    file_id = None
-
-    if update.message is None:
-        return
-
-    if update.message.photo:
-        has_photo = True
-        file_id = update.message.photo[-1].file_id
-        text = (update.message.caption or "").strip()
-    else:
-        text = (update.message.text or "").strip()
-
-    if not has_photo and not text:
-        await chat.send_message("Mandami una foto oppure una descrizione + budget 🙂")
-        await chat.send_message(START_PROMPT, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-        return
-
-    req_id = make_req_id(chat.id, (text or "photo"))
-    save_request(req_id, chat.id, user.id if user else None, user.username if user else None, text)
-
-    # Messaggio per staff
-    header = format_user_header(update)
-    body = f"{header}\n<b>Request ID:</b> <code>{req_id}</code>\n\n<b>Richiesta:</b>\n{text if text else '📷 (solo foto)'}"
-
+async def safe_dm(app, chat_id: int, text: str):
     try:
-        if has_photo and file_id:
-            admin_msg = await context.bot.send_photo(
-                chat_id=TARGET_CHAT_ID,
-                photo=file_id,
-                caption=body,
-                parse_mode=ParseMode.HTML,
-                reply_markup=admin_keyboard(req_id),
+        await app.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True
+        )
+        return True
+    except Exception:
+        return False
+
+# =========================
+# HANDLERS
+# =========================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_chat.send_message(
+        WELCOME_TEXT,
+        parse_mode=ParseMode.MARKDOWN,
+        disable_web_page_preview=True,
+        reply_markup=keyboard_welcome(),
+    )
+
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    data = q.data or ""
+    if data == "new_request":
+        await q.message.reply_text("Ok ✅ Inviami *foto, descrizione e budget*.", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # staff decision buttons
+    if data.startswith("found:") or data.startswith("notfound:"):
+        action, request_id = data.split(":", 1)
+
+        with db_conn() as con:
+            row = con.execute(
+                "SELECT user_chat_id, status FROM requests WHERE request_id=?",
+                (request_id,)
+            ).fetchone()
+
+        if not row:
+            await q.message.reply_text("⚠️ Request ID non trovato nel database.")
+            return
+
+        user_chat_id, status = row
+        if status in ("found", "notfound"):
+            await q.message.reply_text("ℹ️ Questa richiesta è già stata aggiornata.")
+            return
+
+        new_status = "found" if action == "found" else "notfound"
+        notify_text = FOUND_TEXT if new_status == "found" else NOT_FOUND_TEXT
+
+        # salva stato
+        with db_conn() as con:
+            con.execute(
+                "UPDATE requests SET status=? WHERE request_id=?",
+                (new_status, request_id)
+            )
+            con.commit()
+
+        # notifica utente in privato
+        ok = await safe_dm(context.application, int(user_chat_id), notify_text)
+
+        # aggiorna messaggio staff (edit + nota)
+        try:
+            suffix = "\n\n✅ *Aggiornato:* TROVATO" if new_status == "found" else "\n\n❌ *Aggiornato:* NON TROVATO"
+            await q.message.edit_text(
+                q.message.text_markdown_v2 if False else (q.message.text + suffix),
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=None,
+                disable_web_page_preview=True
+            )
+        except Exception:
+            # se non si può editare, manda solo una reply
+            pass
+
+        if ok:
+            await q.message.reply_text("📨 Utente notificato in privato.")
+        else:
+            await q.message.reply_text("⚠️ Non riesco a scrivere all’utente (deve aver avviato il bot in privato).")
+        return
+
+async def submit_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Accettiamo richieste SOLO in privato (così non sporchi il gruppo)
+    if update.effective_chat.type != "private":
+        return
+
+    user = update.effective_user
+    user_id = user.id
+    username = user.username
+
+    photo_file_id = None
+    text = ""
+
+    # Caso foto
+    if update.message.photo:
+        photo_file_id = update.message.photo[-1].file_id
+        text = update.message.caption or ""
+    else:
+        text = update.message.text or ""
+
+    text = clean_text(text)
+    budget = extract_budget(text)
+    description = text
+
+    # Se non c'è budget, chiediamo di reinviare
+    if not budget:
+        await update.effective_chat.send_message(
+            "❗ Mi serve anche il *budget* (es: `50€`).\n"
+            "Rimanda la richiesta con budget incluso.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    request_id = uuid.uuid4().hex[:10]
+    created_at = datetime.now(timezone.utc).isoformat()
+
+    # invia allo staff
+    staff_text = staff_message_text(
+        request_id=request_id,
+        user_id=user_id,
+        username=username,
+        description=description,
+        budget=budget
+    )
+
+    sent = None
+    try:
+        if photo_file_id:
+            sent = await context.application.bot.send_photo(
+                chat_id=int(TARGET_CHAT_ID),
+                photo=photo_file_id,
+                caption=staff_text,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=keyboard_staff(request_id),
             )
         else:
-            admin_msg = await context.bot.send_message(
-                chat_id=TARGET_CHAT_ID,
-                text=body,
-                parse_mode=ParseMode.HTML,
-                reply_markup=admin_keyboard(req_id),
-                disable_web_page_preview=True,
+            sent = await context.application.bot.send_message(
+                chat_id=int(TARGET_CHAT_ID),
+                text=staff_text,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=keyboard_staff(request_id),
+                disable_web_page_preview=True
             )
-
-        link_admin_message(int(TARGET_CHAT_ID), admin_msg.message_id, req_id)
-
     except Exception as e:
-        await chat.send_message(f"⚠️ Errore inoltro al gruppo staff: {e}")
+        await update.effective_chat.send_message(f"⚠️ Errore inoltro al gruppo staff: {e}")
         return
 
-    # Conferma + “riprompt” immediato
-    await chat.send_message(AFTER_REQUEST_PROMPT, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    staff_message_id = sent.message_id if sent else None
 
+    # salva nel DB
+    with db_conn() as con:
+        con.execute(
+            """
+            INSERT INTO requests
+            (request_id, user_id, user_chat_id, username, created_at, description, budget, photo_file_id,
+             staff_chat_id, staff_message_id, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+            """,
+            (
+                request_id, user_id, update.effective_chat.id, username, created_at,
+                description, budget, photo_file_id, TARGET_CHAT_ID, staff_message_id
+            )
+        )
+        con.commit()
 
-async def on_admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not query:
+    # conferma all'utente (UNA SOLA VOLTA, niente doppioni)
+    await update.effective_chat.send_message(
+        CONFIRM_TEXT,
+        parse_mode=ParseMode.MARKDOWN,
+        disable_web_page_preview=True,
+        reply_markup=keyboard_after_request(),
+    )
+
+async def admin_found(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # fallback: /trovato <request_id>
+    if update.effective_chat.id != int(TARGET_CHAT_ID):
         return
-
-    await query.answer()
-
-    data = query.data or ""
-    if ":" not in data:
+    if not context.args:
+        await update.message.reply_text("Uso: /trovato <request_id>")
         return
-
-    action, req_id = data.split(":", 1)
-
-    # Troviamo l'utente legato a quella richiesta (tramite msg admin)
-    admin_chat_id = query.message.chat_id if query.message else None
-    admin_message_id = query.message.message_id if query.message else None
-    if admin_chat_id is None or admin_message_id is None:
-        return
-
-    row = get_req_by_admin_message(admin_chat_id, admin_message_id)
+    request_id = context.args[0].strip()
+    with db_conn() as con:
+        row = con.execute("SELECT user_chat_id, status FROM requests WHERE request_id=?", (request_id,)).fetchone()
     if not row:
-        await query.edit_message_reply_markup(reply_markup=None)
+        await update.message.reply_text("Request ID non trovato.")
         return
-
-    _req_id, user_chat_id, status = row
-    if status in ("added", "not_found"):
-        # Già gestito: non reinviare
-        await query.answer("Già aggiornato.", show_alert=False)
+    user_chat_id, status = row
+    if status in ("found", "notfound"):
+        await update.message.reply_text("Già aggiornato.")
         return
+    with db_conn() as con:
+        con.execute("UPDATE requests SET status='found' WHERE request_id=?", (request_id,))
+        con.commit()
+    ok = await safe_dm(context.application, int(user_chat_id), FOUND_TEXT)
+    await update.message.reply_text("OK ✅ notificato" if ok else "⚠️ Non posso scrivere all’utente (deve avviare il bot in privato).")
 
-    user_chat_id_int = int(user_chat_id)
+async def admin_notfound(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # fallback: /nontrovato <request_id>
+    if update.effective_chat.id != int(TARGET_CHAT_ID):
+        return
+    if not context.args:
+        await update.message.reply_text("Uso: /nontrovato <request_id>")
+        return
+    request_id = context.args[0].strip()
+    with db_conn() as con:
+        row = con.execute("SELECT user_chat_id, status FROM requests WHERE request_id=?", (request_id,)).fetchone()
+    if not row:
+        await update.message.reply_text("Request ID non trovato.")
+        return
+    user_chat_id, status = row
+    if status in ("found", "notfound"):
+        await update.message.reply_text("Già aggiornato.")
+        return
+    with db_conn() as con:
+        con.execute("UPDATE requests SET status='notfound' WHERE request_id=?", (request_id,))
+        con.commit()
+    ok = await safe_dm(context.application, int(user_chat_id), NOT_FOUND_TEXT)
+    await update.message.reply_text("OK ✅ notificato" if ok else "⚠️ Non posso scrivere all’utente (deve avviare il bot in privato).")
 
-    if action == "ok":
-        set_status(req_id, "added")
-        # Notifica utente
-        await context.bot.send_message(
-            chat_id=user_chat_id_int,
-            text=USER_ADDED_MSG + "\n" + START_PROMPT,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-        # Aggiorna messaggio staff
-        await query.edit_message_reply_markup(reply_markup=None)
-        await context.bot.send_message(chat_id=admin_chat_id, text=f"✅ Notificato l’utente per Request ID {req_id}")
-
-    elif action == "no":
-        set_status(req_id, "not_found")
-        await context.bot.send_message(
-            chat_id=user_chat_id_int,
-            text=USER_NOT_FOUND_MSG + "\n" + START_PROMPT,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-        await query.edit_message_reply_markup(reply_markup=None)
-        await context.bot.send_message(chat_id=admin_chat_id, text=f"❌ Notificato l’utente (non trovato) per Request ID {req_id}")
-
-    else:
-        await query.answer("Azione non valida.", show_alert=False)
-
-
-async def healthcheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_chat.send_message("✅ Bot online.")
-
-
+# =========================
+# MAIN
+# =========================
 def main():
     init_db()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("ping", healthcheck))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(on_button))
+    app.add_handler(CommandHandler("trovato", admin_found))
+    app.add_handler(CommandHandler("nontrovato", admin_notfound))
 
-    # Pulsanti staff
-    app.add_handler(CallbackQueryHandler(on_admin_button))
-
-    # Richieste utenti: testo o foto
-    app.add_handler(MessageHandler(filters.PHOTO | filters.TEXT, handle_request))
+    # richieste utenti: testo o foto, SOLO in privato
+    app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, submit_request))
 
     print(f"DEBUG avvio → TARGET_CHAT_ID: '{TARGET_CHAT_ID}' | BOT_TOKEN settato: {bool(BOT_TOKEN)}")
-    print("Bot in avvio...")
-
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()
