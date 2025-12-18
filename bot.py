@@ -1,6 +1,4 @@
 import os
-import time
-import hashlib
 import sqlite3
 from contextlib import closing
 from datetime import datetime
@@ -8,20 +6,14 @@ from datetime import datetime
 from dotenv import load_dotenv
 load_dotenv()
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    InputMediaPhoto,
-    InputMediaVideo,
-)
+from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
     CommandHandler,
     MessageHandler,
-    ReactionHandler,
+    MessageReactionHandler,
     filters,
 )
 
@@ -50,51 +42,42 @@ def init_db():
             )
         """)
 
-def save_link(t_chat, t_msg, s_chat, s_msg):
+def save_link(target_chat_id, target_msg_id, source_chat_id, source_msg_id):
     with closing(sqlite3.connect(DB_PATH)) as conn, conn, closing(conn.cursor()) as cur:
         cur.execute(
             "INSERT OR REPLACE INTO links VALUES (?,?,?,?)",
-            (str(t_chat), int(t_msg), str(s_chat), int(s_msg))
+            (str(target_chat_id), int(target_msg_id), str(source_chat_id), int(source_msg_id))
         )
 
-def lookup_source(t_chat, t_msg):
+def lookup_source(target_chat_id, target_msg_id):
     with closing(sqlite3.connect(DB_PATH)) as conn, closing(conn.cursor()) as cur:
         cur.execute(
             "SELECT source_chat_id, source_msg_id FROM links WHERE target_chat_id=? AND target_msg_id=?",
-            (str(t_chat), int(t_msg))
+            (str(target_chat_id), int(target_msg_id))
         )
         return cur.fetchone()
 
 # ===============================
-# UI
-# ===============================
-def get_cta_keyboard():
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Vai alla Spreadsheet", url="https://www.cravattacinese.com")]]
-    )
-
-# ===============================
-# START COMMAND
+# START
 # ===============================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
+    await update.message.reply_text(
         "DIMMI COSA CERCHI!\n\n"
         "📸 Invia una FOTO\n"
         "📝 Una DESCRIZIONE\n"
         "💰 Il tuo BUDGET\n\n"
-        "E noi lo caricheremo su CravattaCinese.com"
+        "E noi lo caricheremo su CRAVATTACINESE"
     )
-    await update.message.reply_text(text, reply_markup=get_cta_keyboard())
 
 # ===============================
-# PRIVATE MESSAGE HANDLER
+# HANDLE PRIVATE REQUEST
 # ===============================
 async def handle_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     user = msg.from_user
 
     header = (
-        f"<b>NUOVA RICHIESTA FIND</b>\n"
+        f"<b>NUOVA RICHIESTA</b>\n"
         f"👤 {user.full_name}\n"
         f"🆔 <code>{user.id}</code>\n"
         f"🕒 {datetime.now().strftime('%d/%m/%Y %H:%M')}"
@@ -115,36 +98,38 @@ async def handle_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_link(TARGET_CHAT_ID, sent.message_id, msg.chat_id, msg.message_id)
 
     await msg.reply_text(
-        "Richiesta ricevuta ✅\n"
-        "Ti aggiorneremo appena troviamo il prodotto.",
-        reply_markup=get_cta_keyboard()
+        "✅ Richiesta ricevuta.\n"
+        "Ti aggiorneremo appena troviamo il prodotto."
     )
 
 # ===============================
-# REACTION HANDLER ❤️ / 👎
+# HANDLE REACTIONS ❤️ / 👎
 # ===============================
-async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reaction = update.message_reaction
     if not reaction:
         return
 
-    mapped = lookup_source(str(reaction.chat.id), reaction.message_id)
+    chat_id = reaction.chat.id
+    msg_id = reaction.message_id
+
+    mapped = lookup_source(str(chat_id), int(msg_id))
     if not mapped:
         return
 
     source_chat_id, source_msg_id = mapped
-    emojis = [r.emoji for r in reaction.new_reaction]
+    emoji = reaction.new_reaction[0].emoji
 
-    if "❤️" in emojis:
+    if emoji == "❤️":
         text = (
             "❤️ *PRODOTTO TROVATO!*\n\n"
             "Il prodotto che cercavi è stato trovato ed inserito "
             "nella spreadsheet su *CravattaCinese.com*."
         )
-    elif "👎" in emojis:
+    elif emoji == "👎":
         text = (
             "👎 *PRODOTTO NON TROVATO*\n\n"
-            "Al momento non siamo riusciti a trovare il prodotto richiesto."
+            "Purtroppo il prodotto che cercavi non è stato trovato."
         )
     else:
         return
@@ -160,11 +145,7 @@ async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MAIN
 # ===============================
 def main():
-    print(
-        "DEBUG avvio →",
-        "TARGET_CHAT_ID:", TARGET_CHAT_ID,
-        "| BOT_TOKEN settato:", bool(BOT_TOKEN)
-    )
+    print("🤖 Bot in avvio…")
 
     init_db()
 
@@ -172,7 +153,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, handle_private))
-    app.add_handler(ReactionHandler(handle_reaction))
+    app.add_handler(MessageReactionHandler(on_reaction))
 
     app.run_polling()
 
