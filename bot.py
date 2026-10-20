@@ -42,8 +42,8 @@ def after_request_text():
     reply = (
         "✅ <b>Richiesta ricevuta!</b>\n\n"
         "I seller cercheranno l'articolo e, se disponibile, lo pubblicheranno nel gruppo Best Find.\n\n"
-        "🔁 Puoi inviare un'altra richiesta quando vuoi: <b>foto + descrizione</b> "
-        "(budget opzionale)."
+        "🔁 Puoi inviare un’altra richiesta quando vuoi: basta una <b>foto</b>. "
+        "Descrizione e budget sono opzionali; puoi aggiungerli nella didascalia della foto."
     )
     if BEST_FIND_URL:
         reply += f'\n\n🔗 <a href="{escape(BEST_FIND_URL, quote=True)}">Apri Best Find</a>'
@@ -56,9 +56,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 <b>Benvenuto su Find Bot!</b>\n\n"
         "📸 Invia una foto o uno screenshot dell'articolo che cerchi.\n"
-        "📝 Aggiungi una descrizione (marca, modello, colore, taglia).\n"
+        "📝 Descrizione opzionale: aggiungila nella didascalia della foto.\n"
         "💰 Puoi specificare un budget, ma è opzionale.\n\n"
-        "Puoi mandare foto e testo insieme oppure in due messaggi separati. "
+        "La foto viene pubblicata subito, anche senza descrizione. "
         "La richiesta sarà pubblicata <b>senza nome, username e ID Telegram</b> "
         "nel gruppo privato dei seller.\n\n"
         "⚠️ Evita di inserire dati personali o screenshot che li mostrano.",
@@ -79,7 +79,7 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     # Non accetta documenti/video/audio: solo foto Telegram e testo.
     if not msg.photo and not (msg.text or msg.caption):
-        await msg.reply_text("Invia una foto o uno screenshot, con una descrizione. Il budget è opzionale.")
+        await msg.reply_text("Invia una foto o uno screenshot. Descrizione e budget sono opzionali.")
         return
 
     chat_id = msg.chat_id
@@ -92,15 +92,16 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending[chat_id] = state
 
     if not state["photo"]:
-        await msg.reply_text("📸 Ho ricevuto la descrizione. Ora inviami una foto dell'articolo.")
-        return
-    if not state["description"]:
-        await msg.reply_text("✍️ Ho ricevuto la foto. Ora inviami una descrizione dell'articolo (budget opzionale).")
+        await msg.reply_text("📸 Ho ricevuto il testo. Ora inviami una foto dell’articolo; puoi anche scrivere la descrizione direttamente nella didascalia.")
         return
 
+    # Basta la foto: se non è presente una descrizione pubblichiamo comunque.
     description, budget = split_description_and_budget(state["description"])
-    caption = "🔎 <b>NEW REQUEST</b>\n\n📝 <b>Description:</b> " + escape(description)
-    # Se l'utente specifica un budget, è già incluso nel testo originale.
+    caption = "🔎 <b>NEW REQUEST</b>"
+    if description:
+        caption += "\n\n📝 <b>Description:</b> " + escape(description)
+    else:
+        caption += "\n\n📝 <b>Description:</b> Not provided"
     if budget and "budget" not in description.lower() and "budg" not in description.lower():
         caption += f"\n💰 <b>Budget:</b> €{escape(budget)}"
 
