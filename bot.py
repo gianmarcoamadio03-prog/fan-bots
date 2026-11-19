@@ -140,6 +140,26 @@ def clear_seller_session(seller_id):
         db.execute("DELETE FROM seller_sessions WHERE seller_id = ?", (seller_id,))
 
 
+def user_chat_button(username):
+    """Pulsante URL per aprire direttamente la chat Telegram dell'utente."""
+    username = (username or "").lstrip("@")
+    if not re.fullmatch(r"[A-Za-z0-9_]{5,32}", username):
+        return None
+    return InlineKeyboardMarkup([[InlineKeyboardButton(
+        "💬 Apri chat utente", url=f"https://t.me/{username}"
+    )]])
+
+
+def seller_contact_text(request_id, username):
+    return (
+        f"✅ <b>Richiesta {escape(request_id)} assegnata a te!</b>\n\n"
+        f"👤 Utente: @{escape(username)}\n"
+        "Premi il pulsante per aprire direttamente la sua chat Telegram.\n\n"
+        f"In alternativa, invia /claim {escape(request_id)} qui su FindBot "
+        "per inoltrare un link senza uscire dal bot."
+    )
+
+
 def split_description_and_budget(text):
     text = (text or "").strip()
     match = BUDGET_RE.search(text)
@@ -181,12 +201,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     claims = seller_claims(update.effective_user.id)
     if claims:
-        ids = ", ".join(row["request_id"] for row in claims)
         await update.message.reply_text(
-            "👋 Hai delle richieste già assegnate: " + ids + "\n"
-            "Per inviare un link tramite il bot scrivi /claim seguito dal numero richiesta, "
-            "ad esempio /claim " + claims[0]["request_id"]
+            "👋 Hai richieste già assegnate. Usa /claim CODICE_RICHIESTA "
+            "per aprire la chat dell'utente oppure inviare il link tramite FindBot."
         )
+        for row in claims:
+            request = get_request(row["request_id"])
+            if request and request["username"]:
+                await update.message.reply_text(
+                    seller_contact_text(row["request_id"], request["username"]),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=user_chat_button(request["username"]),
+                )
         return
     if not update.effective_user.username:
         await update.message.reply_text(username_required_text(), parse_mode=ParseMode.HTML)
@@ -225,8 +251,9 @@ async def seller_claim_command(update: Update, context: ContextTypes.DEFAULT_TYP
     set_seller_session(update.effective_user.id, request_id)
     if request["username"]:
         await update.message.reply_text(
-            f"✅ Richiesta {request_id}. Puoi contattare direttamente @{request['username']}.\n"
-            "Oppure manda qui un link: lo inoltrerò all'utente tramite FindBot."
+            seller_contact_text(request_id, request["username"]),
+            parse_mode=ParseMode.HTML,
+            reply_markup=user_chat_button(request["username"]),
         )
     else:
         await update.message.reply_text(
@@ -271,18 +298,36 @@ async def on_claim_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except TelegramError:
         log.exception("Impossibile rimuovere il pulsante dopo il claim %s", request_id)
 
+    # Un popup callback di Telegram NON rende cliccabili gli URL.
+    # Il pulsante che apre una chat privata va mandato al seller in una
+    # conversazione privata con il bot; mai nel gruppo seller.
     if request["username"]:
-        notice = (
-            f"✅ Richiesta {request_id} assegnata a te!\n"
-            f"Contatta: https://t.me/{request['username']}\n"
-            f"Oppure apri FindBot e usa /claim {request_id}."
-        )
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_user.id,
+                text=seller_contact_text(request_id, request["username"]),
+                parse_mode=ParseMode.HTML,
+                reply_markup=user_chat_button(request["username"]),
+            )
+        except TelegramError:
+            # Telegram impedisce ai bot di scrivere a chi non ha avviato il bot.
+            await query.answer(
+                f"Assegnata a te! Apri FindBot, premi Avvia e scrivi /claim {request_id} "
+                "per ottenere il pulsante Apri chat utente.",
+                show_alert=True,
+            )
+        else:
+            await query.answer(
+                "✅ Richiesta assegnata! Apri la chat privata con FindBot: "
+                "troverai il pulsante 💬 Apri chat utente.",
+                show_alert=True,
+            )
     else:
-        notice = (
-            f"✅ Richiesta {request_id} assegnata a te! L'utente non ha username.\n"
-            f"Apri FindBot in privato e invia /claim {request_id} per mandargli il link."
+        await query.answer(
+            f"Assegnata a te! Apri FindBot e usa /claim {request_id} "
+            "per inviare il link all'utente.",
+            show_alert=True,
         )
-    await query.answer(notice[:200], show_alert=True)
     try:
         await context.bot.send_message(
             chat_id=request["user_id"],
