@@ -1,4 +1,4 @@
-"""Find Bot — richieste private e presa in carico esclusiva dei seller.
+"""Find Bot — richieste anonime e presa in carico esclusiva dei seller.
 
 Requisiti: python-telegram-bot >= 20, python-dotenv.
 Variabili: BOT_TOKEN, TARGET_CHAT_ID, BEST_FIND_URL (opzionale), DB_PATH (opzionale).
@@ -147,12 +147,27 @@ def split_description_and_budget(text):
     return text, budget
 
 
+def username_required_text():
+    return (
+        "🔒 <b>Per inviare una richiesta devi impostare uno username Telegram.</b>\n\n"
+        "I seller devono poterti contattare in privato per inviarti il link.\n\n"
+        "📱 <b>Come impostarlo:</b>\n"
+        "1. Apri Telegram → Impostazioni.\n"
+        "2. Vai su Modifica profilo → Username (o Nome utente).\n"
+        "3. Scegli uno username disponibile e salva.\n"
+        "4. Torna qui e invia la foto.\n\n"
+        "✅ Il tuo username <b>non comparirà nel gruppo seller</b>: "
+        "verrà mostrato <b>solo al primo seller</b> che prende in carico la richiesta.\n\n"
+        "⚠️ Uno username Telegram è pubblico per sua natura: "
+        "chi lo conosce può cercarti su Telegram."
+    )
+
+
 def after_request_text():
     reply = (
         "✅ <b>Richiesta ricevuta!</b>\n\n"
         "Un solo seller potrà prenderla in carico. "
-        "Se hai uno username Telegram, quel seller potrà vederlo per contattarti; "
-        "altrimenti potrà inviarti il link tramite questo bot.\n\n"
+        "Solo quel seller potrà vedere il tuo username per contattarti.\n\n"
         "🔁 Puoi inviare un'altra richiesta quando vuoi con una <b>foto</b>. "
         "Descrizione e budget sono opzionali."
     )
@@ -173,14 +188,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "ad esempio /claim " + claims[0]["request_id"]
         )
         return
+    if not update.effective_user.username:
+        await update.message.reply_text(username_required_text(), parse_mode=ParseMode.HTML)
+        return
     await update.message.reply_text(
         "👋 <b>Benvenuto su Find Bot!</b>\n\n"
         "📸 Invia una foto o uno screenshot dell'articolo che cerchi.\n"
         "📝 Descrizione e budget sono opzionali.\n\n"
         "La richiesta apparirà nel gruppo seller senza nome, username o ID. "
-        "<b>Il primo seller che la prende in carico</b> potrà vedere il tuo username "
-        "Telegram (se lo hai) per scriverti in privato. "
-        "Se non hai uno username, potrà inviarti il link attraverso il bot.\n\n"
+        "<b>Solo il primo seller che la prende in carico</b> potrà vedere il tuo "
+        "username Telegram e scriverti in privato.\n\n"
         "⚠️ Evita di inviare dati personali o screenshot che li mostrano.",
         parse_mode=ParseMode.HTML,
     )
@@ -307,6 +324,13 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         clear_seller_session(seller_id)
         await msg.reply_text("✅ Link inviato in privato all'utente.")
+        return
+
+    # Controllo al momento di ogni nuova richiesta, non soltanto su /start.
+    # Lo username non viene mai pubblicato nel gruppo seller.
+    if not update.effective_user.username:
+        pending.pop(msg.chat_id, None)
+        await msg.reply_text(username_required_text(), parse_mode=ParseMode.HTML)
         return
 
     if not msg.photo and not (msg.text or msg.caption):
